@@ -33,11 +33,19 @@
 -include_lib("couch_mrview/include/couch_mrview.hrl").
 -include_lib("fabric/include/fabric2.hrl").
 
-% TODO:
-%  * Handle timeouts of transaction and other errors
 
 -define(KEY_SIZE_LIMIT, 8000).
 -define(VALUE_SIZE_LIMIT, 64000).
+
+% These are all of the errors that we can fix by using
+% a smaller batch size.
+-define(IS_RECOVERABLE_ERROR(Code), (
+    (Code == 1004) % timed_out
+    orelse (Code == 1007) % transaction_too_old
+    orelse (Code == 1031) % transaction_timed_out
+    orelse (Code == 2101) % transaction_too_large
+)).
+
 
 spawn_link() ->
     proc_lib:spawn_link(?MODULE, init, []).
@@ -80,6 +88,8 @@ init() ->
 
     State = #{
         tx_db => undefined,
+        tx_size => 0,
+        docs_read => 0,
         db_uuid => DbUUID,
         db_seq => undefined,
         view_seq => undefined,
@@ -88,7 +98,6 @@ init() ->
         job => Job,
         job_data => Data,
         count => 0,
-        limit => num_changes(),
         changes_done => 0,
         doc_acc => [],
         design_opts => Mrst#mrst.design_opts
@@ -162,7 +171,33 @@ add_error(Error, Reason, Data) ->
 
 
 update(#{} = Db, Mrst0, State0) ->
-    {Mrst2, State4} = fabric2_fdb:transactional(Db, fun(TxDb) ->
+    Limit = couch_views_batch:start(Mrst0),
+    {Mrst1, State1} = try
+        do_update(Db, Mrst0, State0#{limit => Limit})
+    catch
+        error:{erlfdb_error, Error} when ?IS_RECOVERABLE_ERROR(Error) ->
+            couch_views_batch:failure(Mrst0),
+            update(Db, Mrst0, State0)
+    end,
+    case State1 of
+        finished ->
+            couch_eval:release_map_context(Mrst1#mrst.qserver);
+        _ ->
+            #{
+                docs_read := DocsRead,
+                tx_size := TxSize
+            } = State1,
+            couch_views_batch:success(Mrst1, TxSize, DocsRead),
+            update(Db, Mrst1, State1)
+    end.
+
+
+do_update(Db, Mrst0, State0) ->
+    fabric2_fdb:transactional(Db, fun(TxDb) ->
+        #{
+            tx := Tx
+        } = TxDb,
+
         State1 = get_update_start_state(TxDb, Mrst0, State0),
 
         {ok, State2} = fold_changes(State1),
@@ -184,6 +219,8 @@ update(#{} = Db, Mrst0, State0) ->
 
         ChangesDone = ChangesDone0 + length(DocAcc),
 
+        TxSize = erlfdb:wait(erlfdb:get_approximate_size(Tx)),
+
         case Count < Limit of
             true ->
                 maybe_set_build_status(TxDb, Mrst1, ViewVS,
@@ -195,20 +232,15 @@ update(#{} = Db, Mrst0, State0) ->
                 State3 = report_progress(State2, update),
                 {Mrst1, State3#{
                     tx_db := undefined,
+                    tx_size := TxSize,
+                    docs_read := length(DocAcc),
                     count := 0,
                     doc_acc := [],
                     changes_done := ChangesDone,
                     view_seq := LastSeq
                 }}
         end
-    end),
-
-    case State4 of
-        finished ->
-            couch_eval:release_map_context(Mrst2#mrst.qserver);
-        _ ->
-        update(Db, Mrst2, State4)
-    end.
+    end).
 
 
 maybe_set_build_status(_TxDb, _Mrst1, not_found, _State) ->
@@ -542,10 +574,6 @@ fail_job(Job, Data, Error, Reason) ->
     NewData = add_error(Error, Reason, Data),
     couch_jobs:finish(undefined, Job, NewData),
     exit(normal).
-
-
-num_changes() ->
-    config:get_integer("couch_views", "change_limit", 100).
 
 
 retry_limit() ->
